@@ -1,0 +1,757 @@
+const { default: makeWASocket, DisconnectReason, useMultiFileAuthState } = require('@whiskeysockets/baileys')
+const { GoogleGenerativeAI, HarmCategory, HarmBlockThreshold } = require("@google/generative-ai")
+const qrcode = require('qrcode-terminal')
+const pino = require('pino')
+require('dotenv').config()
+
+
+// Initialize all Maps and tracking variables at the top
+const userStats = new Map()
+
+
+
+// Add these at the top with other initializations
+const memberStats = new Map()
+
+// Function to track member activity
+function updateMemberStats(groupId, userId, messageType = 'text') {
+    const groupKey = `${groupId}_${userId}`
+    const now = Date.now()
+    const stats = memberStats.get(groupKey) || {
+        messageCount: 0,
+        lastActive: null,
+        firstSeen: now,
+        messageTypes: {
+            text: 0,
+            media: 0,
+            sticker: 0,
+            reaction: 0
+        },
+        dailyActivity: {},
+        timeRanges: Array(24).fill(0), // 24 hours tracking
+    }
+
+    stats.messageCount++
+    stats.lastActive = now
+    stats.messageTypes[messageType]++
+
+    // Track daily activity
+    const today = new Date().toDateString()
+    stats.dailyActivity[today] = (stats.dailyActivity[today] || 0) + 1
+
+    // Track time range
+    const hour = new Date().getHours()
+    stats.timeRanges[hour]++
+
+    memberStats.set(groupKey, stats)
+}
+
+// Function to analyze member behavior
+async function analyzeMember(sock, groupId, userId) {
+    const groupKey = `${groupId}_${userId}`
+    const stats = memberStats.get(groupKey) || {
+        messageCount: 0,
+        lastActive: null,
+        messageTypes: { text: 0, media: 0, sticker: 0, reaction: 0 }
+    }
+
+    const daysSinceFirstSeen = stats.firstSeen ?
+        Math.ceil((Date.now() - stats.firstSeen) / (1000 * 60 * 60 * 24)) : 0
+
+    const averageMessagesPerDay = daysSinceFirstSeen ?
+        (stats.messageCount / daysSinceFirstSeen).toFixed(2) : 0
+
+    const lastActiveDays = stats.lastActive ?
+        Math.ceil((Date.now() - stats.lastActive) / (1000 * 60 * 60 * 24)) : 'Never'
+
+    return {
+        stats,
+        analysis: {
+            averageMessagesPerDay,
+            daysSinceLastActive: lastActiveDays,
+            mostActiveHour: stats.timeRanges.indexOf(Math.max(...stats.timeRanges)),
+            preferredMessageType: Object.entries(stats.messageTypes)
+                .sort((a, b) => b[1] - a[1])[0][0]
+        }
+    }
+}
+
+
+
+// Initialize Gemini with safety settings
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY)
+
+// Different model instances for different purposes
+const models = {
+    pro: genAI.getGenerativeModel({ model: "gemini-1.5-pro" }),
+    flash: genAI.getGenerativeModel({ model: "gemini-1.5-flash" }),
+    vision: genAI.getGenerativeModel({ model: "gemini-pro-vision" })
+}
+
+// Safety settings
+const safetySettings = [
+    {
+        category: HarmCategory.HARM_CATEGORY_HARASSMENT,
+        threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+    },
+    {
+        category: HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+        threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+    }
+]
+
+// Function to track user stats
+function updateUserStats(userId, messageType = 'text') {
+    const stats = userStats.get(userId) || {
+        commands: 0,
+        messages: 0,
+        lastActive: null,
+        messageTypes: {
+            text: 0,
+            commands: 0,
+            media: 0
+        }
+    }
+    
+    stats.messages++
+    stats.lastActive = new Date()
+    stats.messageTypes[messageType]++
+    
+    userStats.set(userId, stats)
+}
+
+// Function to get user stats
+function getUserStats(userId) {
+    return userStats.get(userId) || {
+        commands: 0,
+        messages: 0,
+        lastActive: null,
+        messageTypes: {
+            text: 0,
+            commands: 0,
+            media: 0
+        }
+    }
+}
+
+
+
+// Chat history for conversations
+const chatHistory = new Map()
+
+async function getGeminiResponse(message, modelType = 'pro', history = null) {
+    try {
+        const model = models[modelType]
+
+        // Start chat if history is needed
+        if (history) {
+            const chat = model.startChat({
+                history: history,
+                safetySettings: safetySettings
+            })
+            const result = await chat.sendMessage(message)
+            return result.response.text()
+        } else {
+            const result = await model.generateContent(message)
+            return result.response.text()
+        }
+    } catch (error) {
+        console.error('Gemini API Error:', error)
+        return "Sorry, I encountered an error. Please try again later! 🤔"
+    }
+}
+
+// Function to handle structured output
+async function getStructuredResponse(prompt, schema) {
+    try {
+        const result = await models.pro.generateContent({
+            contents: [{ role: "user", parts: [{ text: prompt }] }],
+            generationConfig: {
+                temperature: 0.1,
+                topK: 1,
+                topP: 1,
+                stopSequences: ["}"],
+                candidateCount: 1,
+                maxOutputTokens: 800,
+            }
+        })
+        return result.response.text()
+    } catch (error) {
+        console.error('Structured Output Error:', error)
+        return null
+    }
+}
+
+async function getGroupMemberInfo(sock, groupId) {
+    try {
+        const groupMetadata = await sock.groupMetadata(groupId)
+        return groupMetadata.participants.map(participant => ({
+            id: participant.id, admin: participant.admin, isSuperAdmin: participant.isSuperAdmin
+        }))
+    } catch (error) {
+        console.error('Error fetching group info:', error)
+        return []
+    }
+}
+
+
+async function connectToWhatsApp() {
+    console.log('Connecting to WhatsApp...')
+
+    const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys')
+
+    const sock = makeWASocket({
+        auth: state,
+        printQRInTerminal: true,
+        logger: pino({ level: 'silent' })
+    })
+
+    // Connection handling code...
+    sock.ev.on('connection.update', async (update) => {
+        const { connection, lastDisconnect, qr } = update
+
+        if (connection === 'open') {
+            console.log('Bot is now connected! 🤖')
+
+            // Send welcome message to all groups
+            const groups = await sock.groupFetchAllParticipating()
+            for (const group of Object.values(groups)) {
+                await sock.sendMessage(group.id, {
+                    text: ``
+                })
+            }
+        }
+
+        if (qr) {
+            console.log('QR Code received, please scan!')
+        }
+
+        if (connection === 'close') {
+            const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut
+            if (shouldReconnect) {
+                connectToWhatsApp()
+            }
+        }
+
+
+    })
+
+    sock.ev.on('creds.update', saveCreds)
+
+    // Message handling
+    sock.ev.on('messages.upsert', async ({ messages }) => {
+        const m = messages[0]
+
+        if (!m.message) return
+
+        const messageText = m.message.conversation ||
+            (m.message.extendedTextMessage && m.message.extendedTextMessage.text) ||
+            (m.message.imageMessage && m.message.imageMessage.caption)
+
+        if (!messageText) return
+
+        const chat = m.key.remoteJid
+        const sender = m.key.participant || m.key.remoteJid
+        const isGroup = chat.endsWith('@g.us')
+
+        const msg = messageText.toLowerCase()
+
+        
+        // Update stats for every message
+        updateUserStats(sender, msg.startsWith('!') ? 'commands' : 'text')
+
+        // Help command with context-aware response
+        if (msg === '!help') {
+            const helpText = isGroup ?
+                `
+*Available Commands:* 📝
+
+Basic Commands:
+!ask [question] - Ask a question
+!chat [message] - Start a conversation
+!quick [question] - Quick response
+
+Group-Specific Commands:
+!members - List all group members
+!whohas [@mention] [role/trait] - Check member roles
+!active - Show most active members
+!stats - Show group statistics
+
+General Commands:
+!help - Show this help message
+!clear - Clear chat history
+
+Example:
+!ask What is quantum computing?
+!members
+!whohas @user admin`
+                :
+                `
+*Available Commands:* 📝
+
+Basic Commands:
+!ask [question] - Ask a question
+!chat [message] - Start a conversation
+!quick [question] - Quick response
+!help - Show this help message
+!clear - Clear chat history
+
+Example:
+!ask What is quantum computing?
+!chat Tell me a story`
+
+            await sock.sendMessage(chat, { text: helpText })
+        }
+
+
+        // Group statistics
+        else if (isGroup && msg === '!stats') {
+            const members = await getGroupMemberInfo(sock, chat)
+            const groupMetadata = await sock.groupMetadata(chat)
+
+            const stats = `
+*Group Statistics* 📊
+
+Group Name: ${groupMetadata.subject}
+Total Members: ${members.length}
+Admins: ${members.filter(m => m.admin).length}
+Created: ${new Date(groupMetadata.creation * 1000).toLocaleDateString()}
+            `
+
+            await sock.sendMessage(chat, { text: stats })
+        }
+
+        if (msg.startsWith('!analyze ')) {
+            const query = messageText.slice(9).toLowerCase()
+            const members = await getGroupMemberInfo(sock, chat)
+            const groupMetadata = await sock.groupMetadata(chat)
+            
+            if (query.includes('quiet') || query.includes('inactive')) {
+                // Find quietest members
+                const memberAnalytics = await Promise.all(
+                    members.map(async member => {
+                        const analysis = await analyzeMember(sock, chat, member.id)
+                        return { member, analysis }
+                    })
+                )
+                
+                // Sort by message count (ascending)
+                const quietestMembers = memberAnalytics
+                    .sort((a, b) => a.analysis.stats.messageCount - b.analysis.stats.messageCount)
+                    .slice(0, 3)
+                
+                let response = "*Quietest Members Analysis* 🤫\n\n"
+                
+                for (const {member, analysis} of quietestMembers) {
+                    const memberName = `@${member.id.split('@')[0]}`
+                    response += `*${memberName}*\n`
+                    response += `Messages: ${analysis.stats.messageCount}\n`
+                    response += `Last Active: ${analysis.analysis.daysSinceLastActive} days ago\n`
+                    response += `Average Messages/Day: ${analysis.analysis.averageMessagesPerDay}\n\n`
+                }
+                
+                await sock.sendMessage(chat, { 
+                    text: response,
+                    mentions: quietestMembers.map(m => m.member.id)
+                })
+            }
+            
+            else if (query.includes('active')) {
+                // Find most active members
+                const memberAnalytics = await Promise.all(
+                    members.map(async member => {
+                        const analysis = await analyzeMember(sock, chat, member.id)
+                        return { member, analysis }
+                    })
+                )
+                
+                // Sort by message count (descending)
+                const activeMembers = memberAnalytics
+                    .sort((a, b) => b.analysis.stats.messageCount - a.analysis.stats.messageCount)
+                    .slice(0, 3)
+                
+                let response = "*Most Active Members* 🎯\n\n"
+                
+                for (const {member, analysis} of activeMembers) {
+                    const memberName = `@${member.id.split('@')[0]}`
+                    response += `*${memberName}*\n`
+                    response += `Messages: ${analysis.stats.messageCount}\n`
+                    response += `Most Active Hour: ${analysis.analysis.mostActiveHour}:00\n`
+                    response += `Preferred Message Type: ${analysis.analysis.preferredMessageType}\n\n`
+                }
+                
+                await sock.sendMessage(chat, { 
+                    text: response,
+                    mentions: activeMembers.map(m => m.member.id)
+                })
+            }
+            
+            else if (query.includes('pattern')) {
+                // Analyze messaging patterns
+                const memberAnalytics = await Promise.all(
+                    members.map(async member => {
+                        const analysis = await analyzeMember(sock, chat, member.id)
+                        return { member, analysis }
+                    })
+                )
+                
+                let response = "*Group Messaging Patterns* 📊\n\n"
+                
+                // Most common message type
+                const messageTypes = memberAnalytics.reduce((acc, {analysis}) => {
+                    const type = analysis.analysis.preferredMessageType
+                    acc[type] = (acc[type] || 0) + 1
+                    return acc
+                }, {})
+                
+                const mostCommonType = Object.entries(messageTypes)
+                    .sort((a, b) => b[1] - a[1])[0][0]
+                
+                response += `Most Common Message Type: ${mostCommonType}\n`
+                response += `Active Members: ${memberAnalytics.filter(m => 
+                    m.analysis.stats.messageCount > 0).length}/${members.length}\n\n`
+                
+                await sock.sendMessage(chat, { text: response })
+            }
+        }
+
+        if (msg.startsWith('!analyze ')) {
+            const query = messageText.slice(9).toLowerCase()
+            const members = await getGroupMemberInfo(sock, chat)
+            const groupMetadata = await sock.groupMetadata(chat)
+            
+            if (query.includes('quiet') || query.includes('inactive')) {
+                // Find quietest members
+                const memberAnalytics = await Promise.all(
+                    members.map(async member => {
+                        const analysis = await analyzeMember(sock, chat, member.id)
+                        return { member, analysis }
+                    })
+                )
+                
+                // Sort by message count (ascending)
+                const quietestMembers = memberAnalytics
+                    .sort((a, b) => a.analysis.stats.messageCount - b.analysis.stats.messageCount)
+                    .slice(0, 3)
+                
+                let response = "*Quietest Members Analysis* 🤫\n\n"
+                
+                for (const {member, analysis} of quietestMembers) {
+                    const memberName = `@${member.id.split('@')[0]}`
+                    response += `*${memberName}*\n`
+                    response += `Messages: ${analysis.stats.messageCount}\n`
+                    response += `Last Active: ${analysis.analysis.daysSinceLastActive} days ago\n`
+                    response += `Average Messages/Day: ${analysis.analysis.averageMessagesPerDay}\n\n`
+                }
+                
+                await sock.sendMessage(chat, { 
+                    text: response,
+                    mentions: quietestMembers.map(m => m.member.id)
+                })
+            }
+            
+            else if (query.includes('active')) {
+                // Find most active members
+                const memberAnalytics = await Promise.all(
+                    members.map(async member => {
+                        const analysis = await analyzeMember(sock, chat, member.id)
+                        return { member, analysis }
+                    })
+                )
+                
+                // Sort by message count (descending)
+                const activeMembers = memberAnalytics
+                    .sort((a, b) => b.analysis.stats.messageCount - a.analysis.stats.messageCount)
+                    .slice(0, 3)
+                
+                let response = "*Most Active Members* 🎯\n\n"
+                
+                for (const {member, analysis} of activeMembers) {
+                    const memberName = `@${member.id.split('@')[0]}`
+                    response += `*${memberName}*\n`
+                    response += `Messages: ${analysis.stats.messageCount}\n`
+                    response += `Most Active Hour: ${analysis.analysis.mostActiveHour}:00\n`
+                    response += `Preferred Message Type: ${analysis.analysis.preferredMessageType}\n\n`
+                }
+                
+                await sock.sendMessage(chat, { 
+                    text: response,
+                    mentions: activeMembers.map(m => m.member.id)
+                })
+            }
+            
+            else if (query.includes('pattern')) {
+                // Analyze messaging patterns
+                const memberAnalytics = await Promise.all(
+                    members.map(async member => {
+                        const analysis = await analyzeMember(sock, chat, member.id)
+                        return { member, analysis }
+                    })
+                )
+                
+                let response = "*Group Messaging Patterns* 📊\n\n"
+                
+                // Most common message type
+                const messageTypes = memberAnalytics.reduce((acc, {analysis}) => {
+                    const type = analysis.analysis.preferredMessageType
+                    acc[type] = (acc[type] || 0) + 1
+                    return acc
+                }, {})
+                
+                const mostCommonType = Object.entries(messageTypes)
+                    .sort((a, b) => b[1] - a[1])[0][0]
+                
+                response += `Most Common Message Type: ${mostCommonType}\n`
+                response += `Active Members: ${memberAnalytics.filter(m => 
+                    m.analysis.stats.messageCount > 0).length}/${members.length}\n\n`
+                
+                await sock.sendMessage(chat, { text: response })
+            }
+        }
+        
+        // Natural language queries about members
+        else if (msg.startsWith('!who ')) {
+            const query = messageText.slice(5).toLowerCase()
+            
+            try {
+                // Use Gemini to understand the query
+                const prompt = `Based on the following group statistics, answer this question: "${query}"\n\n` +
+                             `Context: This is about a WhatsApp group with ${members.length} members.`
+                
+                const memberAnalytics = await Promise.all(
+                    members.map(async member => {
+                        const analysis = await analyzeMember(sock, chat, member.id)
+                        return { member, analysis }
+                    })
+                )
+                
+                // Add member data to context
+                const memberContext = memberAnalytics.map(({member, analysis}) => ({
+                    id: member.id.split('@')[0],
+                    messages: analysis.stats.messageCount,
+                    lastActive: analysis.analysis.daysSinceLastActive,
+                    averageMessages: analysis.analysis.averageMessagesPerDay
+                }))
+                
+                const response = await getGeminiResponse(
+                    prompt + '\n\nMember Data: ' + JSON.stringify(memberContext),
+                    'pro'
+                )
+                
+                await sock.sendMessage(chat, { 
+                    text: response,
+                    mentions: members.map(m => m.id)
+                })
+            } catch (error) {
+                console.error('Error analyzing members:', error)
+                await sock.sendMessage(chat, { 
+                    text: 'Sorry, I had trouble analyzing the members. Please try again.'
+                })
+            }
+        }
+
+
+        // Regular commands (work in both private and group chats)
+        else if (msg.startsWith('!ask ')) {
+            await sock.sendPresenceUpdate('composing', chat)
+            const query = messageText.slice(5)
+
+            // Add context if it's a group chat
+            let contextualQuery = query
+            if (isGroup) {
+                const groupMetadata = await sock.groupMetadata(chat)
+                contextualQuery = `Context: This question is being asked in a WhatsApp group named "${groupMetadata.subject}" with ${groupMetadata.participants.length} members.\n\nQuestion: ${query}`
+            }
+
+            const response = await getGeminiResponse(contextualQuery, 'pro')
+            await sock.sendMessage(chat, {
+                text: `@${sender.split('@')[0]}, ${response}`,
+                mentions: [sender]
+            })
+        }
+
+
+        // Activity tracking (for groups)
+        if (isGroup) {
+            // Update user activity
+            const userActivity = userStats.get(sender) || {
+                commands: 0,
+                messages: 0,
+                lastActive: null
+            }
+
+            userActivity.messages++
+            if (msg.startsWith('!')) {
+                userActivity.commands++
+            }
+            userActivity.lastActive = new Date()
+            userStats.set(sender, userActivity)
+        }
+
+        // Group-specific commands
+        else if (isGroup && msg === '!members') {
+            const members = await getGroupMemberInfo(sock, chat)
+            let memberList = '*Group Members:*\n\n'
+
+            for (const member of members) {
+                const memberNumber = member.id.split('@')[0]
+                const role = member.admin ? (member.isSuperAdmin ? '👑 Super Admin' : '⭐ Admin') : '👤 Member'
+                memberList += `• @${memberNumber} - ${role}\n`
+            }
+
+            await sock.sendMessage(chat, {
+                text: memberList,
+                mentions: members.map(m => m.id)
+            })
+        }
+
+        // Check member roles/traits
+        else if (isGroup && msg.startsWith('!whohas ')) {
+            const query = messageText.slice(8).toLowerCase()
+            const members = await getGroupMemberInfo(sock, chat)
+            let response = ''
+
+            if (query.includes('admin')) {
+                const admins = members.filter(m => m.admin)
+                response = '*Admins in this group:*\n\n' +
+                    admins.map(m => `• @${m.id.split('@')[0]}`).join('\n')
+            } else {
+                // You can add more role/trait checks here
+                response = 'Please specify a valid role (admin)'
+            }
+
+            await sock.sendMessage(chat, {
+                text: response,
+                mentions: members.filter(m => m.admin).map(m => m.id)
+            })
+        }
+
+
+        else if (msg.startsWith('!chat ')) {
+            const query = messageText.slice(6)
+            let history = chatHistory.get(sender) || []
+            history.push({ role: "user", parts: [{ text: query }] })
+
+            const response = await getGeminiResponse(query, 'pro', history)
+            history.push({ role: "model", parts: [{ text: response }] })
+
+            chatHistory.set(sender, history)
+
+            await sock.sendMessage(chat, {
+                text: `@${sender.split('@')[0]}, ${response}`,
+                mentions: [sender]
+            })
+        }
+
+        else if (msg.startsWith('!quick ')) {
+            const query = messageText.slice(7)
+            const response = await getGeminiResponse(query, 'flash')
+            await sock.sendMessage(chat, {
+                text: `@${sender.split('@')[0]}, ${response}`,
+                mentions: [sender]
+            })
+        }
+
+        else if (msg === '!clear') {
+            chatHistory.delete(sender)
+            await sock.sendMessage(chat, {
+                text: `@${sender.split('@')[0]}, Chat history cleared! 🧹`,
+                mentions: [sender]
+            })
+        }
+
+        else if (msg.startsWith('!json ')) {
+            const query = messageText.slice(6)
+            const response = await getStructuredResponse(query)
+            await sock.sendMessage(chat, {
+                text: `@${sender.split('@')[0]}, ${response}`,
+                mentions: [sender]
+            })
+        }
+
+        // Add fun interactive elements
+        else if (msg === '!demo') {
+            await sock.sendMessage(chat, {
+                text: `*Let me show you what I can do!* 🎯
+
+Try these cool examples:
+
+1️⃣ *Fun Facts*
+!ask Tell me an interesting fact about space
+
+2️⃣ *Problem Solving*
+!ask How can I improve my productivity?
+
+3️⃣ *Quick Math*
+!quick Calculate 15% of 85
+
+4️⃣ *Creative Writing*
+!chat Write a short story about a brave cat
+
+Pick any example and try it! 😊`
+            })
+        }
+
+        // Add user stats
+        const userStats = new Map()
+
+        function updateUserStats(userId, command) {
+            const stats = userStats.get(userId) || { commands: 0, lastUsed: null }
+            stats.commands++
+            stats.lastUsed = new Date()
+            userStats.set(userId, stats)
+        }
+
+        if (msg === '!stats') {
+            const stats = getUserStats(sender)
+            const response = `
+*Your Activity Stats* 📊
+
+Total Messages: ${stats.messages}
+Commands Used: ${stats.messageTypes.commands}
+Last Active: ${stats.lastActive ? stats.lastActive.toLocaleString() : 'Never'}
+Text Messages: ${stats.messageTypes.text}
+            `
+            await sock.sendMessage(chat, { 
+                text: response,
+                mentions: [sender]
+            })
+        }
+
+        else if (msg === '!groupstats' && isGroup) {
+            const members = await sock.groupMetadata(chat).then(meta => meta.participants)
+            let response = '*Group Activity Stats* 📊\n\n'
+            
+            for (const member of members) {
+                const stats = getUserStats(member.id)
+                if (stats.messages > 0) {
+                    response += `@${member.id.split('@')[0]}:
+Messages: ${stats.messages}
+Commands: ${stats.messageTypes.commands}
+Last Active: ${stats.lastActive ? stats.lastActive.toLocaleString() : 'Never'}\n\n`
+                }
+            }
+            
+            await sock.sendMessage(chat, { 
+                text: response,
+                mentions: members.map(m => m.id)
+            })
+        }
+    })
+}
+
+// Add this function to pin the message
+async function pinMessage(jid, message) {
+    try {
+        const msg = await sock.sendMessage(jid, message)
+        // Pin the message if supported
+        await sock.sendMessage(jid, { pinMessage: true }, { quoted: msg })
+    } catch (error) {
+        console.error('Error pinning message:', error)
+    }
+}
+
+// Start the bot
+connectToWhatsApp().catch(err => {
+    console.error('Fatal error:', err)
+})
