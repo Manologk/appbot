@@ -4,6 +4,27 @@ const qrcode = require('qrcode-terminal')
 const pino = require('pino')
 require('dotenv').config()
 
+
+
+
+
+// Add at the top with other requires
+const express = require('express')
+const app = express()
+const port = process.env.PORT || 10000;
+
+// Add this before your WhatsApp connection code
+app.get('/', (req, res) => {
+    res.send('WhatsApp Bot is running!')
+})
+
+app.listen(port, '0.0.0.0', () => {
+    console.log(`Server is running on port ${port}`)
+})
+
+
+
+
 // Global variables and maps
 const userStats = new Map()
 const memberStats = new Map()
@@ -26,18 +47,18 @@ function updateUserStats(userId, messageType = 'text') {
             media: 0
         }
     }
-    
+
     stats.messages++
     stats.lastActive = new Date()
     stats.lastUsed = new Date()
-    
+
     if (messageType === 'command') {
         stats.commands++
         stats.messageTypes.commands++
     } else {
         stats.messageTypes[messageType]++
     }
-    
+
     userStats.set(userId, stats)
     return stats
 }
@@ -77,8 +98,8 @@ async function analyzeGroupActivity(sock, groupId) {
                 id: member.id,
                 messageCount: stats.messages || 0,
                 lastActive: stats.lastActive,
-                daysSinceLastActive: stats.lastActive ? 
-                    Math.floor((new Date() - new Date(stats.lastActive)) / (1000 * 60 * 60 * 24)) : 
+                daysSinceLastActive: stats.lastActive ?
+                    Math.floor((new Date() - new Date(stats.lastActive)) / (1000 * 60 * 60 * 24)) :
                     Infinity
             }
         })
@@ -112,45 +133,62 @@ function createPersonalityResponse(member, trait) {
     return responses[Math.floor(Math.random() * responses.length)]
 }
 
+
+
+async function connectWithRetry() {
+    try {
+        await connectToWhatsApp()
+    } catch (error) {
+        console.error('Failed to connect:', error)
+        // Retry after 30 seconds
+        setTimeout(connectWithRetry, 30000)
+    }
+}
+
+
+
 // Main WhatsApp connection function
 async function connectToWhatsApp() {
+    console.log('Connecting to WhatsApp...')
+
     const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys')
-    
+
     const sock = makeWASocket({
         auth: state,
         printQRInTerminal: true,
-        logger: logger
+        logger: logger,
+        browser: ['Whatsapp Bot', 'Chrome', '1.0.0']
     })
-    
+
     sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect, qr } = update
-        
-        if(qr) {
+
+        if (qr) {
             console.log('QR Code received, please scan!')
         }
-        
-        if(connection === 'close') {
+
+        if (connection === 'close') {
             const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut
-            if(shouldReconnect) {
+            if (shouldReconnect) {
                 connectToWhatsApp()
             }
-        } else if(connection === 'open') {
+        } else if (connection === 'open') {
             console.log('Bot is now connected! 🤖')
         }
     })
-    
+
     sock.ev.on('creds.update', saveCreds)
-    
+
     sock.ev.on('messages.upsert', async ({ messages }) => {
         const m = messages[0]
         if (!m.message) return
-        
-        const messageText = m.message.conversation || 
-                          (m.message.extendedTextMessage && m.message.extendedTextMessage.text) || 
-                          (m.message.imageMessage && m.message.imageMessage.caption)
-        
+
+        const messageText = m.message.conversation ||
+            (m.message.extendedTextMessage && m.message.extendedTextMessage.text) ||
+            (m.message.imageMessage && m.message.imageMessage.caption)
+
         if (!messageText) return
-        
+
         const chat = m.key.remoteJid
         const sender = m.key.participant || m.key.remoteJid
         const isGroup = chat.endsWith('@g.us')
@@ -187,7 +225,7 @@ Note: Fun commands work with "who" instead of "!" 😊`
 
             await sock.sendMessage(chat, { text: helpText })
         }
-        
+
         else if (msg === '!stats') {
             const stats = getUserStats(sender)
             const response = `
@@ -198,51 +236,51 @@ Commands Used: ${stats.commands}
 Last Active: ${stats.lastActive ? stats.lastActive.toLocaleString() : 'Never'}
 Text Messages: ${stats.messageTypes.text}
 `
-            await sock.sendMessage(chat, { 
+            await sock.sendMessage(chat, {
                 text: response,
                 mentions: [sender]
             })
         }
-        
+
         else if (msg.startsWith('!ask ')) {
             await sock.sendPresenceUpdate('composing', chat)
             const query = messageText.slice(5)
             const response = await getGeminiResponse(query)
-            await sock.sendMessage(chat, { 
+            await sock.sendMessage(chat, {
                 text: `@${sender.split('@')[0]}, ${response}`,
                 mentions: [sender]
             })
         }
-        
+
         else if (msg.startsWith('!chat ')) {
             await sock.sendPresenceUpdate('composing', chat)
             const query = messageText.slice(6)
             try {
                 const response = await getGeminiResponse(query)
-                await sock.sendMessage(chat, { 
+                await sock.sendMessage(chat, {
                     text: `@${sender.split('@')[0]}, ${response}`,
                     mentions: [sender]
                 })
             } catch (error) {
                 console.error('Chat error:', error)
-                await sock.sendMessage(chat, { 
+                await sock.sendMessage(chat, {
                     text: 'Sorry, I had trouble processing that. Please try again! 🙏'
                 })
             }
         }
-        
+
         else if (msg === '!quiet' || msg === '!quietest') {
             if (!isGroup) {
-                await sock.sendMessage(chat, { 
-                    text: 'This command can only be used in groups!' 
+                await sock.sendMessage(chat, {
+                    text: 'This command can only be used in groups!'
                 })
                 return
             }
 
             const memberActivity = await analyzeGroupActivity(sock, chat)
             if (memberActivity.length === 0) {
-                await sock.sendMessage(chat, { 
-                    text: 'No activity data available yet!' 
+                await sock.sendMessage(chat, {
+                    text: 'No activity data available yet!'
                 })
                 return
             }
@@ -255,20 +293,20 @@ Text Messages: ${stats.messageTypes.text}
                 const memberName = `@${member.id.split('@')[0]}`
                 response += `${index + 1}. ${memberName}\n`
                 response += `Messages: ${member.messageCount}\n`
-                response += `Last Active: ${member.lastActive ? 
-                    `${member.daysSinceLastActive} days ago` : 
+                response += `Last Active: ${member.lastActive ?
+                    `${member.daysSinceLastActive} days ago` :
                     'Never active'}\n\n`
             }
 
-            await sock.sendMessage(chat, { 
+            await sock.sendMessage(chat, {
                 text: response,
                 mentions: quietestMembers.map(m => m.id)
             })
         }
-        
+
         else if (msg.startsWith('who ')) {
             if (!isGroup) {
-                await sock.sendMessage(chat, { 
+                await sock.sendMessage(chat, {
                     text: 'This command only works in groups! 👥'
                 })
                 return
@@ -279,7 +317,7 @@ Text Messages: ${stats.messageTypes.text}
             const query = msg.slice(4).toLowerCase()
 
             let response = ''
-            
+
             // Specific trait matching
             if (query.includes('quiet')) {
                 const memberActivity = await analyzeGroupActivity(sock, chat)
@@ -292,9 +330,9 @@ Text Messages: ${stats.messageTypes.text}
                 response = createPersonalityResponse(loudestMember.id, 'the most active')
             }
             // Fun random traits
-            else if (query.includes('black label') || 
-                     query.includes('drink') || 
-                     query.includes('party')) {
+            else if (query.includes('black label') ||
+                query.includes('drink') ||
+                query.includes('party')) {
                 response = createPersonalityResponse(randomMember.id, 'the life of the party')
             }
             else if (query.includes('smart') || query.includes('intelligent')) {
@@ -311,7 +349,7 @@ Text Messages: ${stats.messageTypes.text}
                 response = createPersonalityResponse(randomMember.id, 'exactly like that')
             }
 
-            await sock.sendMessage(chat, { 
+            await sock.sendMessage(chat, {
                 text: response,
                 mentions: [randomMember.id]
             })
@@ -320,6 +358,7 @@ Text Messages: ${stats.messageTypes.text}
 }
 
 // Start the bot
-connectToWhatsApp().catch(err => {
-    console.error('Fatal error:', err)
-})
+// connectToWhatsApp().catch(err => {
+//     console.error('Fatal error:', err)
+// })
+connectWithRetry()
